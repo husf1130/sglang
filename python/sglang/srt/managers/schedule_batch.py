@@ -430,6 +430,8 @@ class RequestStage(str, enum.Enum):
     DECODE_FAKE_OUTPUT = "fake_output"
     DECODE_QUICK_FINISH = "quick_finish"
 
+req_id = 0
+
 
 class Req:
     """The input and output status of a request."""
@@ -466,6 +468,9 @@ class Req:
     ):
         # Input and output info
         self.rid = rid
+        global req_id
+        self.req_id = req_id
+        req_id = req_id + 1
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -560,6 +565,7 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length of the last prefix matching
