@@ -9,7 +9,7 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
-    runtime_checkable,
+    runtime_checkable, List,
 )
 
 import torch
@@ -122,15 +122,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
-    ) -> Tuple[torch.Tensor, Any]:
+        req: Req,
+    ) -> torch.Tensor:
         """
         Preparing KV cache loading from host to device.
         """
         raise NotImplementedError()
 
-    def ready_to_load_host_cache(self) -> Any:
+    def ready_to_load_cache(self, can_run_list: List[Req]) -> Tuple[int, int]:
         """
         Notify the cache controller to start the KV cache loading
         """

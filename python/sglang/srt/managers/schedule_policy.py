@@ -32,6 +32,9 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
+import logging
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -433,7 +436,7 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
-    def _update_prefill_budget(
+    def update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
@@ -454,7 +457,7 @@ class PrefillAdder:
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
-        self._update_prefill_budget(
+        self.update_prefill_budget(
             0,
             req.extend_input_len,
             (
@@ -544,7 +547,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
-            self._update_prefill_budget(
+            self.update_prefill_budget(
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
@@ -560,12 +563,16 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self.update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        enable_hierarchical_cache: bool = False,
     ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
@@ -596,17 +603,15 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
-                )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                prefix_len = len(req.prefix_indices)
-                req.last_matched_prefix_len = prefix_len
+            if enable_hierarchical_cache:
+                new_indices = self.tree_cache.init_load_back(req)
+                if new_indices is not None:
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                    req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                    prefix_len = len(req.prefix_indices)
+                    req.last_matched_prefix_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
@@ -618,7 +623,7 @@ class PrefillAdder:
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
-                self._update_prefill_budget(
+                self.update_prefill_budget(
                     prefix_len,
                     input_tokens,
                     min(
@@ -654,8 +659,7 @@ class PrefillAdder:
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
-
+                self.update_prefill_budget(prefix_len, trunc_len, 0)
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
