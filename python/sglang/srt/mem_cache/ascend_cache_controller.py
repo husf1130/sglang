@@ -161,7 +161,7 @@ class AscendHiCacheController:
 
         self.load_pages_threshold = 1
         # granularity of batch storage IO operations, in number of pages
-        self.storage_batch_size = 128
+        self.storage_batch_size = 256
 
         # create a new communication group for synchronizing storage operations across TP workers
         self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
@@ -186,23 +186,53 @@ class AscendHiCacheController:
         device_indices: List[torch.Tensor],
         direction: str,
     ) -> Optional[list[int]]:
-        # TODO: write/load by step_size
+        batch_memcpy = None
+        if direction == "write":
+            batch_memcpy = self.storage_backend.batch_set
+        elif direction == "load":
+            batch_memcpy = self.storage_backend.batch_get
+        assert batch_memcpy is not None
+
         flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
         ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
         assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
+        results = []
+        for start in range(0, len(flatten_hash_keys), self.storage_batch_size):
+            end = min(
+                start + self.page_size * self.storage_batch_size, len(flatten_hash_keys)
+            )
+            batch_hashes = flatten_hash_keys[start:end]
+            hash_len = len(batch_hashes)
+            target_locations = ptr_list[:hash_len]
+            target_sizes = element_size_list[start:hash_len]
+            memcpy_results = batch_memcpy(
+                keys=batch_hashes,
+                target_locations=target_locations,
+                target_sizes=target_sizes
+            )
+            results.extend(memcpy_results)
 
-        if direction == "write":
-            return self.storage_backend.batch_set(
-                keys=flatten_hash_keys,
-                target_locations=ptr_list,
-                target_sizes=element_size_list
-            )
-        elif direction == "load":
-            return self.storage_backend.batch_get(
-                keys=flatten_hash_keys,
-                target_locations=ptr_list,
-                target_sizes=element_size_list
-            )
+            ptr_list = ptr_list[hash_len:]
+            element_size_list = element_size_list[hash_len:]
+
+        return results
+
+        # flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
+        # ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
+        # assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
+        #
+        # if direction == "write":
+        #     return self.storage_backend.batch_set(
+        #         keys=flatten_hash_keys,
+        #         target_locations=ptr_list,
+        #         target_sizes=element_size_list
+        #     )
+        # elif direction == "load":
+        #     return self.storage_backend.batch_get(
+        #         keys=flatten_hash_keys,
+        #         target_locations=ptr_list,
+        #         target_sizes=element_size_list
+        #     )
 
     def write(self, device_indices: torch.Tensor, origin_req_tokens: List[int]) -> int:
         if self.backup_skip:
