@@ -84,6 +84,7 @@ class AscendHiRadixCache(RadixCache):
         origin_req_tokens,
         device_indices,
     ):
+        start = time.time()
         if len(origin_req_tokens) == 0:
             return
         assert len(origin_req_tokens) == len(device_indices)
@@ -91,6 +92,9 @@ class AscendHiRadixCache(RadixCache):
 
         if self.enable_storage_metrics:
             self.metrics_collector.log_backuped_tokens(succ_num_tokens)
+
+        end = time.time()
+        logger.info(f"write_storage finished, duration {(end - start) * 1000:.3f}ms")
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -169,6 +173,8 @@ class AscendHiRadixCache(RadixCache):
         req: Req,
         mem_quota: Optional[int] = None,
     ):
+        start = time.time()
+
         req.ongoing_loading_l3 = False
 
         matched_len = len(req.prefix_indices)
@@ -198,18 +204,23 @@ class AscendHiRadixCache(RadixCache):
                 last_node = last_node.parent
 
         req.last_node = last_node
+
+        end = time.time()
+        logger.info(f"init_load_back finished, {req.req_id=}, duration {(end - start) * 1000:.3f}ms")
         return None
 
     def ready_to_load_cache(self, can_run_list: List[Req]) -> Tuple[int, int]:
         """
         Notify the cache controller to start the KV cache loading.
         """
+        start = time.time()
         operation: LoadStorageOperation = self.cache_controller.start_loading()
+        total_load_length = 0
         if operation is not None:
             total_load_length = self._update_req_prefix_after_load(can_run_list, operation)
-            return -1, total_load_length
-        else:
-            return -1, 0
+        end = time.time()
+        logger.info(f"ready_to_load_cache finished, duration {(end - start) * 1000:.3f}ms")
+        return -1, total_load_length
 
     def _update_req_prefix_after_load(self, can_run_list: List[Req], op: LoadStorageOperation):
         load_req_list = [req for req in can_run_list if req.ongoing_loading_l3]
@@ -282,6 +293,8 @@ class AscendHiRadixCache(RadixCache):
         return new_node
 
     def insert(self, key: RadixKey, value=None, chunked=False):
+        start = time.time()
+
         key.token_ids = self.key_convert_fn(key.token_ids)
 
         if len(key) == 0:
@@ -338,6 +351,9 @@ class AscendHiRadixCache(RadixCache):
             self._inc_hit_count(new_node, chunked)
 
         self.write_storage(origin_req_tokens, origin_values)
+
+        end = time.time()
+        logger.info(f"insert finished, duration {(end - start) * 1000:.3f}ms")
         return total_prefix_length
 
     def _collect_leaves_device(self):
