@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 import time
 from enum import Enum
@@ -42,6 +43,7 @@ class AscendMemCacheStore(HiCacheStorage):
 
         try:
             self.local_rank = storage_config.tp_rank
+            self.tp_size = storage_config.tp_size
             self.device_id = storage_config.extra_config["device_id"]
             self.is_mla_model = storage_config.is_mla_model
 
@@ -65,12 +67,42 @@ class AscendMemCacheStore(HiCacheStorage):
             logger.info("Init Ascend MemCache successfully.")
             self.warmup()
             logger.info("Ascend MemCache warmup successfully.")
+
+            self.is_device_sdma = self._check_device_sdma()
         except ValueError as e:
             logger.error("Init Ascend MemCache failed: %s", e)
             raise e
         except Exception as e:
             logger.error("An error occurred while Ascend MemCache initialization: %s", e)
             raise e
+
+    def _check_device_sdma(self):
+        config_path = os.environ.get("MMC_LOCAL_CONFIG_PATH")
+        if not config_path:
+            logger.error("MMC_LOCAL_CONFIG_PATH is not set")
+            return False
+
+        try:
+            with open(config_path, "r") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            print(f"FileNotFoundError: {config_path}")
+            return False
+
+        protocol_value = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("ock.mmc.local_service.protocol"):
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    protocol_value = parts[1].strip()
+                break
+
+        if protocol_value == "device_sdma":
+            return True
+        return False
 
     def warmup(self):
         warmup_key = "sglang_memcache_warmup_key" + uuid.uuid4().hex
@@ -82,8 +114,10 @@ class AscendMemCacheStore(HiCacheStorage):
         assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_device(self, mem_pool_device: KVCache):
-        super().register_mem_pool_device(mem_pool_device)
+        if not self.is_device_sdma:
+            return
 
+        super().register_mem_pool_device(mem_pool_device)
         try:
             if self.is_mla_model:
                 k_buffer = self.mem_pool_device.k_buffer
