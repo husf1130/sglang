@@ -180,60 +180,6 @@ class AscendHiCacheController:
     def reset(self):
         self.load_queue.clear()
 
-    def _memcpy_between_device_and_storage(
-        self,
-        hit_group_hash_keys: List[List[str]],
-        device_indices: List[torch.Tensor],
-        direction: str,
-    ) -> Optional[list[int]]:
-        batch_memcpy = None
-        if direction == "write":
-            batch_memcpy = self.storage_backend.batch_set
-        elif direction == "load":
-            batch_memcpy = self.storage_backend.batch_get
-        assert batch_memcpy is not None
-
-        flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
-        ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
-        assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
-        results = []
-        for start in range(0, len(flatten_hash_keys), self.storage_batch_size):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(flatten_hash_keys)
-            )
-            batch_hashes = flatten_hash_keys[start:end]
-            hash_len = len(batch_hashes)
-            target_locations = ptr_list[:hash_len]
-            target_sizes = element_size_list[start:hash_len]
-            memcpy_results = batch_memcpy(
-                keys=batch_hashes,
-                target_locations=target_locations,
-                target_sizes=target_sizes
-            )
-            results.extend(memcpy_results)
-
-            ptr_list = ptr_list[hash_len:]
-            element_size_list = element_size_list[hash_len:]
-
-        return results
-
-        # flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
-        # ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
-        # assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
-        #
-        # if direction == "write":
-        #     return self.storage_backend.batch_set(
-        #         keys=flatten_hash_keys,
-        #         target_locations=ptr_list,
-        #         target_sizes=element_size_list
-        #     )
-        # elif direction == "load":
-        #     return self.storage_backend.batch_get(
-        #         keys=flatten_hash_keys,
-        #         target_locations=ptr_list,
-        #         target_sizes=element_size_list
-        #     )
-
     def write(self, device_indices: torch.Tensor, origin_req_tokens: List[int]) -> int:
         if self.backup_skip:
             return 0
@@ -246,7 +192,7 @@ class AscendHiCacheController:
                 write_results = self._allreduce_results(write_results)
 
             # fresh hash keys and its len get successfully
-            self._parse_success_hashes_from_l3_results(hash_keys, write_results, [len(hash_keys[0])])
+            # self._parse_success_hashes_from_l3_results(hash_keys, [len(hash_keys[0])], write_results)
 
             return write_results.count(1) * self.page_size
         except Empty:
@@ -333,41 +279,74 @@ class AscendHiCacheController:
         )
         return results_tensor.tolist()
 
-    def _get_page_buffer_meta(self, device_indices: List[torch.Tensor]):
-        ptr_list = []
-        element_size_list = []
-        flatten_indices_tensor = torch.cat(device_indices)
-        flatten_index_list = flatten_indices_tensor.tolist()
-        assert len(flatten_index_list) % self.page_size == 0
-
-        for index in range(0, len(flatten_index_list), self.page_size):
-            # convert device index to page index
-            page_index = flatten_index_list[index] // self.page_size
-
-            ptrs = []
-            sizes = []
-            for layer_start_ptr, page_nbytes in zip(self.kv_layer_ptrs, self.kv_page_nbytes):
-                layer_ptr = layer_start_ptr + page_index * page_nbytes
-                ptrs.append(layer_ptr)
-                sizes.append(page_nbytes)
-
-            ptr_list.append(ptrs)
-            element_size_list.append(sizes)
-
-        return ptr_list, element_size_list
-
     def _storage_hit_query(self, operation: LoadStorageOperation) -> tuple[list[Any], list[Any], list[Any]]:
+        assert len(operation.hash_keys) == len(operation.hash_lens)
         flatten_hash_keys = list(chain.from_iterable(operation.hash_keys))
+        if not operation.hash_keys:
+            return [], [], []
+
         exist_results = []
-        for start in range(0, len(flatten_hash_keys), self.storage_batch_size):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(flatten_hash_keys)
-            )
+        total_len = len(flatten_hash_keys)
+        for start in range(0, total_len, self.storage_batch_size):
+            end = min(start + self.storage_batch_size, total_len)
             batch_hashes = flatten_hash_keys[start:end]
             hit_results = self.storage_backend.batch_exists(batch_hashes)
             exist_results.extend(hit_results)
 
         return self._parse_success_hashes_from_l3_results(operation.hash_keys, operation.hash_lens, exist_results)
+
+    def _memcpy_between_device_and_storage(
+        self,
+        hit_group_hash_keys: List[List[str]],
+        device_indices: List[torch.Tensor],
+        direction: str,
+    ) -> Optional[list[int]]:
+        batch_memcpy = None
+        if direction == "write":
+            batch_memcpy = self.storage_backend.batch_set
+        elif direction == "load":
+            batch_memcpy = self.storage_backend.batch_get
+        assert batch_memcpy is not None
+
+        flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
+        if not flatten_hash_keys:
+            return []
+
+        ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
+        assert len(flatten_hash_keys) == len(ptr_list)
+        assert len(flatten_hash_keys) == len(element_size_list)
+        results = []
+        total_elements = len(flatten_hash_keys)
+        for start in range(0, total_elements, self.storage_batch_size):
+            end = min(start + self.storage_batch_size, total_elements)
+            batch_hashes = flatten_hash_keys[start:end]
+            target_locations = ptr_list[start:end]
+            target_sizes = element_size_list[start:end]
+            memcpy_results = batch_memcpy(
+                keys=batch_hashes,
+                target_locations=target_locations,
+                target_sizes=target_sizes
+            )
+            results.extend(memcpy_results)
+
+        return results
+
+        # flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
+        # ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
+        # assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
+        #
+        # if direction == "write":
+        #     return self.storage_backend.batch_set(
+        #         keys=flatten_hash_keys,
+        #         target_locations=ptr_list,
+        #         target_sizes=element_size_list
+        #     )
+        # elif direction == "load":
+        #     return self.storage_backend.batch_get(
+        #         keys=flatten_hash_keys,
+        #         target_locations=ptr_list,
+        #         target_sizes=element_size_list
+        #     )
 
     def _parse_success_hashes_from_l3_results(
         self,
@@ -402,3 +381,26 @@ class AscendHiCacheController:
             hit_hash_lens.append(hit_hash_len)
             hit_token_lens.append(hit_hash_len * self.page_size)
         return hit_group_hash_keys, hit_hash_lens, hit_token_lens
+
+    def _get_page_buffer_meta(self, device_indices: List[torch.Tensor]):
+        ptr_list = []
+        element_size_list = []
+        flatten_indices_tensor = torch.cat(device_indices)
+        flatten_index_list = flatten_indices_tensor.tolist()
+        assert len(flatten_index_list) % self.page_size == 0
+
+        for index in range(0, len(flatten_index_list), self.page_size):
+            # convert device index to page index
+            page_index = flatten_index_list[index] // self.page_size
+
+            ptrs = []
+            sizes = []
+            for layer_start_ptr, page_nbytes in zip(self.kv_layer_ptrs, self.kv_page_nbytes):
+                layer_ptr = layer_start_ptr + page_index * page_nbytes
+                ptrs.append(layer_ptr)
+                sizes.append(page_nbytes)
+
+            ptr_list.append(ptrs)
+            element_size_list.append(sizes)
+
+        return ptr_list, element_size_list
