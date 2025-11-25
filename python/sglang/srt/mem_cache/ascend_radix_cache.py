@@ -79,30 +79,6 @@ class AscendHiRadixCache(RadixCache):
             logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
             return False
 
-    def write_storage(
-        self,
-        origin_req_tokens,
-        device_indices,
-    ):
-        start = time.time()
-        if len(origin_req_tokens) == 0:
-            return
-        assert len(origin_req_tokens) == len(device_indices)
-        succ_num_tokens = self.cache_controller.write(device_indices, origin_req_tokens)
-
-        if self.enable_storage_metrics:
-            self.metrics_collector.log_backuped_tokens(succ_num_tokens)
-
-        end = time.time()
-        logger.info(f"write_storage finished, duration {(end - start) * 1000:.3f}ms")
-
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
-        # skip the hit count update for chunked requests
-        if chunked:
-            return
-        node.hit_count += 1
-
-    # Memcache TODO 需要驱逐卡上内存到L3
     def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
         eviction_heap = [
@@ -265,6 +241,100 @@ class AscendHiRadixCache(RadixCache):
     ):
         pass
 
+    def insert(self, key: RadixKey, value=None, chunked=False):
+        start = time.time()
+
+        key.token_ids = self.key_convert_fn(key.token_ids)
+
+        if len(key) == 0:
+            return 0
+
+        if self.is_eagle and value is not None:
+            # Make sure the value len equal to the EAGLE bigram key len
+            value = value[: len(key)]
+
+        origin_req_tokens = key.token_ids[:]
+        origin_values = value.clone()
+
+        node = self.root_node
+        child_key = self.get_child_key_fn(key)
+        total_prefix_length = 0
+        hash_keys = []
+        while len(key) > 0 and child_key in node.children.keys():
+
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = self.key_match_fn(node.key, key)
+
+            if prefix_len == len(node.key):
+                self._inc_hit_count(node, chunked)
+                total_prefix_length += prefix_len
+            else:
+                # partial match, split the node
+                new_node = self._split_node(node.key, node, prefix_len)
+                self._inc_hit_count(new_node, chunked)
+                total_prefix_length += prefix_len
+                node = new_node
+
+            if self.enable_storage:
+                hash_keys.extend(node.hash_value)
+
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(value)
+
+            if self.enable_storage:
+                last_hash = node.get_last_hash_value()
+                assert (node == self.root_node) or (
+                    last_hash is not None
+                ), "Parent node must have a hash value with storage enabled"
+                new_node.hash_value = get_hash_list(key.token_ids, last_hash, self.page_size)
+                hash_keys.extend(new_node.hash_value)
+
+            self._inc_hit_count(new_node, chunked)
+
+        if self.enable_storage:
+            self.write_storage(origin_req_tokens, origin_values, hash_keys)
+
+        end = time.time()
+        logger.info(f"insert finished, duration {(end - start) * 1000:.3f}ms")
+        return total_prefix_length
+
+    def write_storage(
+        self,
+        origin_req_tokens,
+        device_indices,
+        hash_keys: List[str],
+    ):
+        start = time.time()
+        if len(origin_req_tokens) == 0:
+            return
+        assert len(origin_req_tokens) == len(device_indices)
+        assert len(origin_req_tokens) == len(hash_keys) * self.page_size
+        succ_num_tokens = self.cache_controller.write(device_indices, hash_keys)
+
+        if self.enable_storage_metrics:
+            self.metrics_collector.log_backuped_tokens(succ_num_tokens)
+
+        end = time.time()
+        logger.info(f"write_storage finished, duration {(end - start) * 1000:.3f}ms")
+
+    def _inc_hit_count(self, node: TreeNode, chunked=False):
+        # skip the hit count update for chunked requests
+        if chunked:
+            return
+        node.hit_count += 1
+
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode()
@@ -291,70 +361,6 @@ class AscendHiRadixCache(RadixCache):
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
-
-    def insert(self, key: RadixKey, value=None, chunked=False):
-        start = time.time()
-
-        key.token_ids = self.key_convert_fn(key.token_ids)
-
-        if len(key) == 0:
-            return 0
-
-        if self.is_eagle and value is not None:
-            # Make sure the value len equal to the EAGLE bigram key len
-            value = value[: len(key)]
-
-        origin_req_tokens = key.token_ids[:]
-        origin_values = value.clone()
-
-        node = self.root_node
-        child_key = self.get_child_key_fn(key)
-        total_prefix_length = 0
-
-        while len(key) > 0 and child_key in node.children.keys():
-
-            node = node.children[child_key]
-            node.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(node.key, key)
-
-            if prefix_len == len(node.key):
-                self._inc_hit_count(node, chunked)
-                total_prefix_length += prefix_len
-            else:
-                # partial match, split the node
-                new_node = self._split_node(node.key, node, prefix_len)
-                self._inc_hit_count(new_node, chunked)
-                total_prefix_length += prefix_len
-                node = new_node
-
-            key = key[prefix_len:]
-            value = value[prefix_len:]
-
-            if len(key):
-                child_key = self.get_child_key_fn(key)
-
-        if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value
-            node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
-
-            if self.enable_storage:
-                last_hash = node.get_last_hash_value()
-                assert (node == self.root_node) or (
-                    last_hash is not None
-                ), "Parent node must have a hash value with storage enabled"
-                new_node.hash_value = get_hash_list(key.token_ids, last_hash, self.page_size)
-
-            self._inc_hit_count(new_node, chunked)
-
-        self.write_storage(origin_req_tokens, origin_values)
-
-        end = time.time()
-        logger.info(f"insert finished, duration {(end - start) * 1000:.3f}ms")
-        return total_prefix_length
 
     def _collect_leaves_device(self):
         def is_leaf(node):

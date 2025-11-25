@@ -21,7 +21,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-from sglang.srt.mem_cache.hicache_storage import get_hash_str, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import get_hash_str_v1, HiCacheStorageConfig
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 
@@ -34,7 +34,7 @@ def get_hash_list(token_ids: List[int], prior_hash: str = None, page_size: int =
     last_hash = prior_hash
     token_groups = (token_ids[i:i + page_size] for i in range(0, len(token_ids), page_size))
     for group in token_groups:
-        last_hash = get_hash_str(group, last_hash)
+        last_hash = get_hash_str_v1(group, last_hash)
         hashes.append(last_hash)
     return hashes
 
@@ -126,7 +126,7 @@ class AscendHiCacheController:
         )
 
         self.page_size = page_size
-        self.get_hash_str = get_hash_str
+        self.get_hash_str = get_hash_str_v1
         self.device_id = device_id
         self.is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
@@ -180,13 +180,12 @@ class AscendHiCacheController:
     def reset(self):
         self.load_queue.clear()
 
-    def write(self, device_indices: torch.Tensor, origin_req_tokens: List[int]) -> int:
+    def write(self, device_indices: torch.Tensor, hash_keys: List[str]) -> int:
         if self.backup_skip:
             return 0
 
         try:
-            hash_keys = [get_hash_list(origin_req_tokens)]
-            write_results = self._memcpy_between_device_and_storage(hash_keys, [device_indices], "write")
+            write_results = self._memcpy_between_device_and_storage([hash_keys], [device_indices], "write")
             if self.tp_world_size > 1 and self.is_mla_model is False:
                 # only mha model need all reduce
                 write_results = self._allreduce_results(write_results)
@@ -382,7 +381,35 @@ class AscendHiCacheController:
             hit_token_lens.append(hit_hash_len * self.page_size)
         return hit_group_hash_keys, hit_hash_lens, hit_token_lens
 
-    def _get_page_buffer_meta(self, device_indices: List[torch.Tensor]):
+    def _get_page_buffer_meta(self, device_indices: List[torch.Tensor]) -> Tuple[List[List[int]], List[List[int]]]:
+        # 1. concatenate device index tensors
+        flatten_indices_tensor = torch.cat(device_indices)
+        N = flatten_indices_tensor.shape[0]
+        assert N % self.page_size == 0
+
+        # 2. compute page indices
+        group_first_indices = flatten_indices_tensor[::self.page_size]
+        page_indices = group_first_indices // self.page_size
+
+        # 3. Translate layer_ptrs and page_nbytes into tensors
+        kv_layer_ptrs_tensor = torch.tensor(self.kv_layer_ptrs, dtype=torch.int64,
+                                            device=flatten_indices_tensor.device)
+        kv_page_nbytes_tensor = torch.tensor(self.kv_page_nbytes, dtype=torch.int64,
+                                             device=flatten_indices_tensor.device)
+
+        # 4. compute the pointers and sizes for all layers
+        # Expand page_indices to shape [M, 1] and broadcast with [L] to shape [M, L]
+        page_indices_expanded = page_indices.unsqueeze(1)
+        ptr_tensor = kv_layer_ptrs_tensor + page_indices_expanded * kv_page_nbytes_tensor
+        element_size_tensor = kv_page_nbytes_tensor.unsqueeze(0).expand_as(ptr_tensor)
+
+        # 6. translate to a list
+        ptr_list = ptr_tensor.tolist()
+        element_size_list = element_size_tensor.tolist()
+
+        return ptr_list, element_size_list
+
+    def _get_page_buffer_meta_v0(self, device_indices: List[torch.Tensor]):
         ptr_list = []
         element_size_list = []
         flatten_indices_tensor = torch.cat(device_indices)

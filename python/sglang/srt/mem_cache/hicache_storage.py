@@ -1,3 +1,4 @@
+import array
 import hashlib
 import logging
 import os
@@ -12,6 +13,18 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
+
+def get_hash_str_v1(token_ids: List[int], prior_hash: str = None) -> str:
+    hasher = hashlib.sha256()
+
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+
+    arr = array.array('L', token_ids)
+    batch_bytes = arr.tobytes()
+    hasher.update(batch_bytes)
+
+    return hasher.hexdigest()
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
