@@ -6,6 +6,7 @@ from typing import List, Optional, Any
 from itertools import chain
 
 import torch
+from torch import Tensor
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -117,7 +118,10 @@ class AscendHiCacheController:
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
-
+        if self.mem_pool_device_allocator:
+            self.device = self.mem_pool_device_allocator.device
+        else:
+            self.device = torch.device("cpu")
         # self.kv_layer_ptrs: every layer ptr
         # self.kv_layer_nbytes: the byte length of each layer
         # self.kv_page_nbytes: the page byte length of each layer
@@ -201,21 +205,23 @@ class AscendHiCacheController:
         self,
         rid,
         new_input_tokens,
+        device_indices,
         last_hash: Optional[str] = None,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Load KV caches from L3 storage to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(new_input_tokens))
-        if device_indices is None:
-            return None
-
         self.load_queue.append(LoadStorageOperation(rid, device_indices, new_input_tokens, last_hash))
+        device_indices, free_device_indices = self.start_loading()
+        if free_device_indices is not None:
+            self.mem_pool_device_allocator.free(free_device_indices)
+
         return device_indices
 
-    def start_loading(self) -> Optional[LoadStorageOperation]:
+    def start_loading(self) -> tuple[Tensor, Tensor | None]:
         if len(self.load_queue) == 0:
-            return None
+            empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return empty_value, None
 
         producer_id = self.layer_done_counter.update_producer()
         op = LoadStorageOperation.merge_ops(self.load_queue)
@@ -236,7 +242,10 @@ class AscendHiCacheController:
                     f"Revoking Load operation for request {op.request_ids} due to insufficient hits ({hit_token_lens})."
                 )
                 op.token_lens = [0 for _ in op.token_lens]
-                return op
+                op.hit_device_indices = [[] for _ in op.token_lens]
+
+                empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+                return empty_value, op.free_device_indices[0]
             else:
                 hit_group_hash_keys = [group[:length] for group, length in zip(hit_group_hash_keys, hit_hash_lens)]
                 device_indices = [group[:length] for group, length in zip(op.device_indices, hit_token_lens)]
@@ -259,13 +268,16 @@ class AscendHiCacheController:
                 ]
                 op.token_ids = [ids[hit_len:] for ids, hit_len in zip(op.token_ids, op.token_lens)]
                 logger.debug(f"Load storage {sum(op.hash_lens)} pages for request {op.request_ids}.")
-                return op
+                return op.hit_device_indices[0], op.free_device_indices[0]
 
         except Empty:
             logger.error(f"Load storage {sum(op.hash_lens)} pages for request {op.request_ids}.")
             op.free_device_indices = op.device_indices
             op.token_lens = [0 for _ in op.token_lens]
-            return op
+            op.hit_device_indices = [[] for _ in op.token_lens]
+
+            empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return empty_value, op.free_device_indices[0]
 
     def _allreduce_results(self, results):
         results_tensor = torch.tensor(
@@ -330,23 +342,6 @@ class AscendHiCacheController:
 
         return results
 
-        # flatten_hash_keys = [key for keys in hit_group_hash_keys for key in keys]
-        # ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
-        # assert len(flatten_hash_keys) == len(ptr_list) == len(element_size_list)
-        #
-        # if direction == "write":
-        #     return self.storage_backend.batch_set(
-        #         keys=flatten_hash_keys,
-        #         target_locations=ptr_list,
-        #         target_sizes=element_size_list
-        #     )
-        # elif direction == "load":
-        #     return self.storage_backend.batch_get(
-        #         keys=flatten_hash_keys,
-        #         target_locations=ptr_list,
-        #         target_sizes=element_size_list
-        #     )
-
     def _parse_success_hashes_from_l3_results(
         self,
         group_hash_keys: List[List[str]],
@@ -409,25 +404,3 @@ class AscendHiCacheController:
 
         return ptr_list, element_size_list
 
-    def _get_page_buffer_meta_v0(self, device_indices: List[torch.Tensor]):
-        ptr_list = []
-        element_size_list = []
-        flatten_indices_tensor = torch.cat(device_indices)
-        flatten_index_list = flatten_indices_tensor.tolist()
-        assert len(flatten_index_list) % self.page_size == 0
-
-        for index in range(0, len(flatten_index_list), self.page_size):
-            # convert device index to page index
-            page_index = flatten_index_list[index] // self.page_size
-
-            ptrs = []
-            sizes = []
-            for layer_start_ptr, page_nbytes in zip(self.kv_layer_ptrs, self.kv_page_nbytes):
-                layer_ptr = layer_start_ptr + page_index * page_nbytes
-                ptrs.append(layer_ptr)
-                sizes.append(page_nbytes)
-
-            ptr_list.append(ptrs)
-            element_size_list.append(sizes)
-
-        return ptr_list, element_size_list

@@ -130,7 +130,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def ready_to_load_cache(self, can_run_list: List[Req] = None, adder = None) -> int:
+    def ready_to_load_host_cache(self) -> int:
         """
         Notify the cache controller to start the KV cache loading
         """

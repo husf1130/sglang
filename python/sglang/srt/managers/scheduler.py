@@ -1915,6 +1915,10 @@ class Scheduler(
         if self.chunked_req:
             self.chunked_req.is_chunked += 1
 
+        # Print stats
+        if self.current_scheduler_metrics_enabled():
+            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
                 # Avoid update chunked request many times
@@ -1938,12 +1942,8 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_cache(can_run_list, adder)
+                self.tree_cache.ready_to_load_host_cache()
             )
-
-        # Print stats
-        if self.current_scheduler_metrics_enabled():
-            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
 
         new_batch.prepare_for_extend()
 

@@ -2,9 +2,10 @@ import heapq
 
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import torch
+from torch import Tensor
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -33,7 +34,7 @@ class AscendHiRadixCache(RadixCache):
         device_id: int = 0
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
-        self.allocator = token_to_kv_pool_allocator
+        self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.enable_storage = True
         self.enable_storage_metrics = enable_metrics
         self.hicache_storage_pass_prefix_keys = False
@@ -51,6 +52,9 @@ class AscendHiRadixCache(RadixCache):
                 "dp_rank": self.cache_controller.dp_rank,
             }
             self.metrics_collector = StorageMetricsCollector(labels=labels)
+
+        # # record the node segments with ongoing load back
+        self.ongoing_load_back = {}
 
         super().__init__(
             req_to_token_pool,
@@ -112,37 +116,58 @@ class AscendHiRadixCache(RadixCache):
         return num_evicted
 
     def load_back(
-        self, rid: str, node: TreeNode, new_input_tokens: List[int], mem_quota: Optional[int] = None
-    ) -> torch.Tensor:
-        # todo: more loading policies
-
+        self,
+        rid: str,
+        node: TreeNode,
+        new_input_tokens: List[int],
+        extra_key: Optional[str] = None,
+        mem_quota: Optional[int] = None,
+    ) -> tuple[Tensor | None, TreeNode]:
         start_time = time.perf_counter()
+
         last_hit_node = node
         # protect the last_hit_node from eviction
         self.inc_lock_ref(last_hit_node)
 
+        # alloc device memory
+        new_input_len = len(new_input_tokens)
+        device_indices = self.mem_pool_device_allocator.alloc(new_input_len)
+        if device_indices is None:
+            self.evict(new_input_len)
+            device_indices = self.mem_pool_device_allocator.alloc(new_input_len)
+            if device_indices is None:
+                self.dec_lock_ref(last_hit_node)
+                return None, last_hit_node
+
+        # start to load kvcache from l3 into device hbm
         device_indices = self.cache_controller.load(
             rid=rid,
             new_input_tokens=new_input_tokens,
+            device_indices=device_indices,
             last_hash=node.get_last_hash_value()
         )
 
-        if device_indices is None:
-            self.evict(len(new_input_tokens))
-            device_indices = self.cache_controller.load(
-                rid=rid,
-                new_input_tokens=new_input_tokens,
-                last_hash=node.get_last_hash_value()
-            )
         self.dec_lock_ref(last_hit_node)
-        # self.inc_lock_ref(last_hit_node)
+        if device_indices is None:
+            return None, last_hit_node
+
+        cached_token_len = len(device_indices)
+        new_node = self._insert(
+            RadixKey(new_input_tokens[:cached_token_len], extra_key),
+            device_indices,
+            last_hit_node,
+        )
+
+        self.ongoing_load_back[new_node.id] = new_node
+        self.inc_lock_ref(new_node)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
             )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
-        return device_indices
+            self.metrics_collector.increment_load_back_num_tokens(cached_token_len)
+
+        return device_indices, new_node
 
     def init_load_back(
         self,
@@ -152,88 +177,60 @@ class AscendHiRadixCache(RadixCache):
         start = time.time()
 
         req.ongoing_loading_l3 = False
-
         matched_len = len(req.prefix_indices)
         new_input_tokens = req.fill_ids[matched_len:]
-        if len(new_input_tokens) <= self.page_size:
+        new_input_len = len(new_input_tokens)
+        if new_input_len <= self.page_size:
             return None
 
-        remainder = len(new_input_tokens) % self.page_size
+        remainder = new_input_len % self.page_size
         if remainder == 0:
             # to avoid input tokens = 0 while hit the entire input tokens
-            new_input_tokens = new_input_tokens[:(len(new_input_tokens) - self.page_size)]
+            new_input_tokens = new_input_tokens[:(new_input_len - self.page_size)]
         else:
-            new_input_tokens = new_input_tokens[:(len(new_input_tokens) - remainder)]
+            new_input_tokens = new_input_tokens[:(new_input_len - remainder)]
 
         last_node = req.last_node
         if not last_node.evicted:
-            loading_values = self.load_back(req.rid, last_node, new_input_tokens, mem_quota)
+            loading_values, last_node = self.load_back(req.rid, last_node, new_input_tokens, req.extra_key, mem_quota)
             if loading_values is not None:
                 req.ongoing_loading_l3 = True
-                # logger.debug(f"loading back {req.req_id=} {len(loading_values)} tokens for node {last_node.id}")
+                req.last_node = last_node
+
+                end = time.time()
+                logger.info(f"init_load_back finished, "
+                            f"{req.req_id=}, {len(loading_values)} tokens for node {last_node.id} "
+                            f"duration {(end - start) * 1000:.3f}ms")
+                return loading_values
             else:
-                logger.debug(f"init_load_back {req.req_id=} loading_values is None")
+                logger.info(f"init_load_back {req.req_id=} loading_values is None")
 
         else:
+            logger.error(f"should not enter here")
             # should not enter this branch
             while last_node.evicted:
                 last_node = last_node.parent
 
         req.last_node = last_node
-
-        end = time.time()
-        logger.info(f"init_load_back finished, {req.req_id=}, duration {(end - start) * 1000:.3f}ms")
         return None
 
-    def ready_to_load_cache(self, can_run_list: List[Req] = None, adder = None) -> int:
+    def ready_to_load_host_cache(self) -> int:
         """
         Notify the cache controller to start the KV cache loading.
         """
-        start = time.time()
-        operation: LoadStorageOperation = self.cache_controller.start_loading()
-        if operation is not None:
-            self._update_req_prefix_after_load(operation, can_run_list, adder)
-        end = time.time()
-        logger.info(f"ready_to_load_cache finished, duration {(end - start) * 1000:.3f}ms")
         return -1
 
-    def _update_req_prefix_after_load(
-        self,
-        op: LoadStorageOperation,
-        can_run_list: List[Req],
-        adder,
-    ):
-        assert can_run_list is not None
-        assert adder is not None
-        load_req_list = [req for req in can_run_list if req.ongoing_loading_l3]
-
-        total_load_length = 0
-        for req, token_ids, new_indices, free_indices, hashes, length \
-            in zip(load_req_list, op.token_ids, op.device_indices, op.free_device_indices, op.hash_keys, op.token_lens):
-            if length > 0:
-                # TODO: insert one new node into the radix tree
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                prefix_len = len(req.prefix_indices)
-                req.last_matched_prefix_len = prefix_len
-                adder.update_prefill_budget(length, -length, 0)
-
-                total_load_length += length
-                self.cache_controller.mem_pool_device_allocator.free(free_indices)
-                if self.enable_storage_metrics:
-                    self.metrics_collector.log_prefetched_tokens(length)
-            else:
-                self.cache_controller.mem_pool_device_allocator.free(free_indices)
-
-        logger.debug(
-            f"success loading {total_load_length} tokens from l3 storage")
-        return total_load_length
-
     def check_hicache_events(self):
+        self.loading_check()
         if self.enable_storage_metrics:
             self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def loading_check(self):
+        for node in self.ongoing_load_back.values():
+            self.dec_lock_ref(node)
+        self.ongoing_load_back.clear()
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         return True
@@ -247,11 +244,50 @@ class AscendHiRadixCache(RadixCache):
     ):
         pass
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
+    def _insert(
+        self,
+        key: RadixKey,
+        value: Tensor,
+        parent,
+        chunked=False,
+    ) -> TreeNode:
         start = time.time()
 
         key.token_ids = self.key_convert_fn(key.token_ids)
+        if len(key) == 0:
+            return parent
 
+        child_key = self.get_child_key_fn(key)
+
+        new_node = TreeNode()
+        new_node.parent = parent
+        new_node.key = key
+        new_node.value = value
+        parent.children[child_key] = new_node
+        self.evictable_size_ += len(value)
+
+        if self.enable_storage:
+            last_hash = parent.get_last_hash_value()
+            assert (parent == self.root_node) or (
+                last_hash is not None
+            ), "Parent node must have a hash value with storage enabled"
+            new_node.hash_value = get_hash_list(key.token_ids, last_hash, self.page_size)
+
+        self._inc_hit_count(new_node, chunked)
+
+        end = time.time()
+        logger.info(f"_insert finished, duration {(end - start) * 1000:.3f}ms")
+        return new_node
+
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked=False,
+    ) -> int:
+        start = time.time()
+
+        key.token_ids = self.key_convert_fn(key.token_ids)
         if len(key) == 0:
             return 0
 
