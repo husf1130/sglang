@@ -209,7 +209,7 @@ class AscendHiRadixCache(RadixCache):
 
         total_load_length = 0
         for req, token_ids, new_indices, free_indices, hashes, length \
-            in zip(load_req_list, op.token_ids, op.device_indices, op.free_device_indices, op.hash_keys, op.token_lens):
+            in zip(load_req_list, op.token_ids, op.hit_device_indices, op.free_device_indices, op.hash_keys, op.token_lens):
             if length > 0:
                 # TODO: insert one new node into the radix tree
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])

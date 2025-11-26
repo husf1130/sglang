@@ -236,6 +236,7 @@ class AscendHiCacheController:
                     f"Revoking Load operation for request {op.request_ids} due to insufficient hits ({hit_token_lens})."
                 )
                 op.token_lens = [0 for _ in op.token_lens]
+                op.hit_device_indices = [[] for _ in op.token_lens]
                 return op
             else:
                 hit_group_hash_keys = [group[:length] for group, length in zip(hit_group_hash_keys, hit_hash_lens)]
