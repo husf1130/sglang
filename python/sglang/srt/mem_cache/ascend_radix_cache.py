@@ -185,20 +185,26 @@ class AscendHiRadixCache(RadixCache):
         logger.info(f"init_load_back finished, {req.req_id=}, duration {(end - start) * 1000:.3f}ms")
         return None
 
-    def ready_to_load_cache(self, can_run_list: List[Req]) -> Tuple[int, int]:
+    def ready_to_load_cache(self, can_run_list: List[Req] = None, adder = None) -> int:
         """
         Notify the cache controller to start the KV cache loading.
         """
         start = time.time()
         operation: LoadStorageOperation = self.cache_controller.start_loading()
-        total_load_length = 0
         if operation is not None:
-            total_load_length = self._update_req_prefix_after_load(can_run_list, operation)
+            self._update_req_prefix_after_load(operation, can_run_list, adder)
         end = time.time()
         logger.info(f"ready_to_load_cache finished, duration {(end - start) * 1000:.3f}ms")
-        return -1, total_load_length
+        return -1
 
-    def _update_req_prefix_after_load(self, can_run_list: List[Req], op: LoadStorageOperation):
+    def _update_req_prefix_after_load(
+        self,
+        op: LoadStorageOperation,
+        can_run_list: List[Req],
+        adder,
+    ):
+        assert can_run_list is not None
+        assert adder is not None
         load_req_list = [req for req in can_run_list if req.ongoing_loading_l3]
 
         total_load_length = 0
@@ -210,9 +216,9 @@ class AscendHiRadixCache(RadixCache):
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
                 req.last_matched_prefix_len = prefix_len
+                adder.update_prefill_budget(length, -length, 0)
 
                 total_load_length += length
-
                 self.cache_controller.mem_pool_device_allocator.free(free_indices)
                 if self.enable_storage_metrics:
                     self.metrics_collector.log_prefetched_tokens(length)

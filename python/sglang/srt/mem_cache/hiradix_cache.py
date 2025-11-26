@@ -509,12 +509,12 @@ class HiRadixCache(RadixCache):
         req.last_node = last_node
         return None
 
-    def ready_to_load_cache(self, can_run_list: List[Req]) -> Tuple[int, int]:
+    def ready_to_load_cache(self, can_run_list: List[Req] = None, adder = None) -> int:
         """
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        return self.cache_controller.start_loading(), 0
+        return self.cache_controller.start_loading()
 
     def check_hicache_events(self):
         self.writing_check()

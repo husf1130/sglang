@@ -9,7 +9,8 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
-    runtime_checkable, List,
+    runtime_checkable,
+    List,
 )
 
 import torch
@@ -129,7 +130,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def ready_to_load_cache(self, can_run_list: List[Req]) -> Tuple[int, int]:
+    def ready_to_load_cache(self, can_run_list: List[Req] = None, adder = None) -> int:
         """
         Notify the cache controller to start the KV cache loading
         """
