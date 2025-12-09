@@ -256,6 +256,7 @@ def forward_mla_core_npu(
     attn_output = attn_output.contiguous()
     torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
+    attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
 
     return output
