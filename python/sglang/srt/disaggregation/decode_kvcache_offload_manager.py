@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -41,7 +43,7 @@ class DecodeKVCacheOffloadManager:
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
         server_args: ServerArgs,
-        enable_hierarchical_cache_direct: bool = False,
+        params: CacheInitParams,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -49,12 +51,21 @@ class DecodeKVCacheOffloadManager:
         self.server_args = server_args
         self.request_counter = 0
         self.tree_cache = tree_cache
-        self.enable_hierarchical_cache_direct = enable_hierarchical_cache_direct
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-        if self.enable_hierarchical_cache_direct:
-            self.cache_controller = self.tree_cache.cache_controller
+        if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
+            from sglang.srt.mem_cache.cache_controller_direct import HiCacheControllerDirect
+
+            self.cache_controller = HiCacheControllerDirect(
+                params.token_to_kv_pool_allocator,
+                self.page_size,
+                params.tp_cache_group,
+                storage_backend=server_args.hicache_storage_backend,
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+                device_id=params.gpu_id,
+            )
         else:
             if isinstance(kv_cache, MHATokenToKVPool):
                 self.decode_host_mem_pool = MHATokenToKVPoolHost(
@@ -74,6 +85,8 @@ class DecodeKVCacheOffloadManager:
                 )
             else:
                 raise ValueError("Unsupported KV cache type for decode offload")
+
+            from sglang.srt.managers.cache_controller import HiCacheController
 
             self.cache_controller = HiCacheController(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -238,7 +251,7 @@ class DecodeKVCacheOffloadManager:
         last_hash = prior_hash
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
-            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
+            last_hash = get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
 
@@ -252,7 +265,7 @@ class DecodeKVCacheOffloadManagerDirect(DecodeKVCacheOffloadManager):
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
         server_args: ServerArgs,
-        enable_hierarchical_cache_direct: bool = False,
+        params: CacheInitParams,
     ) -> None:
         super().__init__(
             req_to_token_pool,
@@ -260,7 +273,7 @@ class DecodeKVCacheOffloadManagerDirect(DecodeKVCacheOffloadManager):
             tp_group,
             tree_cache,
             server_args,
-            enable_hierarchical_cache_direct,
+            params,
         )
 
     def offload_kv_cache(self, req) -> bool:

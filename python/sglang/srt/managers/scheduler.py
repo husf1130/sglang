@@ -714,37 +714,11 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        # For L3 storage scenarios in disaggregation mode, decode instance can be used to expand storage capacity
-        if (
-            server_args.disaggregation_mode == "decode"
-            and not self.enable_hierarchical_cache_direct
-            and not self.enable_hierarchical_cache
-            and envs.SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL.get()
-            and server_args.hicache_storage_backend is not None
-        ):
-            storage_config = HiCacheStorageConfig(
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                is_mla_model=False,
-                is_page_first_layout=False,
-                model_name=None,
-                extra_config={"device_id": self.gpu_id},
-            )
-            try:
-                self.storage_backend = StorageBackendFactory.create_backend(
-                    server_args.hicache_storage_backend, storage_config, None
-                )
-            except ValueError as e:
-                logger.error(
-                    f"Failed to init distributed kv pool {server_args.hicache_storage_backend} "
-                    f"for disaggregation_mode=decode: {e}"
-                )
-
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
         ):
-            if self.enable_hierarchical_cache_direct:
+            if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
                 from sglang.srt.disaggregation.decode_kvcache_offload_manager import DecodeKVCacheOffloadManagerDirect
 
                 offload_class = DecodeKVCacheOffloadManagerDirect
@@ -759,6 +733,7 @@ class Scheduler(
                 tp_group=params.tp_cache_group,
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                params=params,
             )
         else:
             self.decode_offload_manager = None
